@@ -5,7 +5,7 @@ import threading
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait, MessageDeleteForbidden, ChatAdminRequired
+from pyrogram.errors import FloodWait, MessageDeleteForbidden, ChatAdminRequired, MessageIdInvalid
 
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
@@ -19,10 +19,12 @@ user_states = {}
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 def parse_message_link(link: str):
-    """Returns (chat_id_or_username, message_id) or None."""
-    m = re.match(r"https?://t\.me/c/(-?\d+)/(\d+)", link.strip())
+    """Returns (chat_id, message_id) or None."""
+    # Private channel: https://t.me/c/1234567890/99
+    m = re.match(r"https?://t\.me/c/(\d+)/(\d+)", link.strip())
     if m:
         return int("-100" + m.group(1)), int(m.group(2))
+    # Public channel: https://t.me/username/99
     m = re.match(r"https?://t\.me/([^/]+)/(\d+)", link.strip())
     if m:
         return m.group(1), int(m.group(2))
@@ -165,7 +167,7 @@ async def handle_callback(client: Client, query: CallbackQuery):
 
         await query.answer("🚀 Starting deletion…")
         await query.edit_message_text(
-            f"⏳ Scanning and deleting messages…\nSelected types: {', '.join(sorted(selected))}"
+            f"⏳ Scanning messages first…\nSelected types: {', '.join(sorted(selected))}"
         )
 
         chat = state["chat"]
@@ -173,91 +175,142 @@ async def handle_callback(client: Client, query: CallbackQuery):
         last_id = state["last_id"]
         del user_states[uid]
 
-        to_delete = []
-        deleted_count = 0
-        failed_count = 0
-        scanned = 0
-        total_range = last_id - first_id + 1
-        status_msg = query.message
-        BATCH = 200
+        await do_delete(client, query.message, chat, first_id, last_id, selected)
 
-        async def flush_delete():
-            nonlocal deleted_count, failed_count
-            if not to_delete:
-                return
-            try:
-                await client.delete_messages(chat, to_delete)
-                deleted_count += len(to_delete)
-            except (MessageDeleteForbidden, ChatAdminRequired):
-                failed_count += len(to_delete)
-            except FloodWait as fw:
-                await asyncio.sleep(fw.value + 1)
-                try:
-                    await client.delete_messages(chat, to_delete)
-                    deleted_count += len(to_delete)
-                except Exception:
-                    failed_count += len(to_delete)
-            except Exception:
-                failed_count += len(to_delete)
-            to_delete.clear()
 
-        chunk_size = 200
-        last_edit_time = 0
+async def do_delete(client: Client, status_msg: Message, chat, first_id: int, last_id: int, selected: set):
+    total_range = last_id - first_id + 1
+    scanned = 0
+    deleted_count = 0
+    failed_count = 0
+    skipped_count = 0
+    last_edit_time = 0
+    chunk_size = 200
 
-        for chunk_start in range(first_id, last_id + 1, chunk_size):
-            chunk_end = min(chunk_start + chunk_size - 1, last_id)
-            ids = list(range(chunk_start, chunk_end + 1))
+    # ── Phase 1: Scan all messages and collect IDs to delete ────────────────
+    ids_to_delete = []
 
+    for chunk_start in range(first_id, last_id + 1, chunk_size):
+        chunk_end = min(chunk_start + chunk_size - 1, last_id)
+        ids = list(range(chunk_start, chunk_end + 1))
+
+        try:
+            messages = await client.get_messages(chat, ids)
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value + 2)
             try:
                 messages = await client.get_messages(chat, ids)
-            except FloodWait as fw:
-                await asyncio.sleep(fw.value + 1)
-                try:
-                    messages = await client.get_messages(chat, ids)
-                except Exception:
-                    scanned += len(ids)
-                    continue
-            except Exception:
+            except Exception as e:
                 scanned += len(ids)
+                skipped_count += len(ids)
                 continue
+        except Exception as e:
+            scanned += len(ids)
+            skipped_count += len(ids)
+            continue
 
-            if not isinstance(messages, list):
-                messages = [messages]
+        if not isinstance(messages, list):
+            messages = [messages]
 
-            for msg in messages:
-                scanned += 1
-                if msg and not msg.empty:
-                    msg_type = get_msg_type(msg)
-                    if msg_type in selected:
-                        to_delete.append(msg.id)
+        for msg in messages:
+            scanned += 1
+            if msg and not msg.empty:
+                msg_type = get_msg_type(msg)
+                if msg_type in selected:
+                    ids_to_delete.append(msg.id)
+                else:
+                    skipped_count += 1
+            else:
+                skipped_count += 1
 
-                if len(to_delete) >= BATCH:
-                    await flush_delete()
+        # Progress update during scan
+        now = asyncio.get_event_loop().time()
+        if now - last_edit_time >= 4:
+            last_edit_time = now
+            pct = int(scanned / total_range * 100)
+            try:
+                await status_msg.edit_text(
+                    f"🔍 **Scanning…** {pct}%\n"
+                    f"Scanned: `{scanned}/{total_range}`\n"
+                    f"Found to delete: `{len(ids_to_delete)}`"
+                )
+            except Exception:
+                pass
 
-            now = asyncio.get_event_loop().time()
-            if now - last_edit_time >= 5:
-                last_edit_time = now
-                pct = int(scanned / total_range * 100)
-                try:
-                    await status_msg.edit_text(
-                        f"⏳ Progress: {pct}%\n"
-                        f"Scanned: {scanned}/{total_range}\n"
-                        f"Queued to delete: {len(to_delete)}\n"
-                        f"Deleted so far: {deleted_count}"
-                    )
-                except Exception:
-                    pass
+    total_to_delete = len(ids_to_delete)
 
-        await flush_delete()
-
+    if total_to_delete == 0:
         await status_msg.edit_text(
-            "✅ **Deletion Complete!**\n\n"
-            f"📊 **Summary**\n"
-            f"• Total IDs scanned: `{scanned}`\n"
-            f"• Messages deleted: `{deleted_count}`\n"
-            f"• Failed/skipped: `{failed_count}`\n"
-            f"• Types deleted: `{', '.join(sorted(selected))}`"
+            "✅ **Scan Complete — Nothing to Delete**\n\n"
+            f"• Scanned: `{scanned}` message IDs\n"
+            f"• No messages matched the selected types: `{', '.join(sorted(selected))}`"
         )
+        return
+
+    try:
+        await status_msg.edit_text(
+            f"🗑 **Deleting {total_to_delete} messages one by one…**\n\n"
+            f"Deleted: `0/{total_to_delete}`"
+        )
+    except Exception:
+        pass
+
+    # ── Phase 2: Delete one by one with 0.5s sleep ──────────────────────────
+    last_edit_time = 0
+
+    for idx, msg_id in enumerate(ids_to_delete, start=1):
+        try:
+            await client.delete_messages(chat, [msg_id])
+            deleted_count += 1
+        except FloodWait as fw:
+            wait = fw.value + 2
+            try:
+                await status_msg.edit_text(
+                    f"⏸ FloodWait — sleeping {wait}s…\n\n"
+                    f"Deleted: `{deleted_count}/{total_to_delete}`\n"
+                    f"Failed: `{failed_count}`"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(wait)
+            # Retry once after flood wait
+            try:
+                await client.delete_messages(chat, [msg_id])
+                deleted_count += 1
+            except Exception:
+                failed_count += 1
+        except (MessageDeleteForbidden, ChatAdminRequired) as e:
+            failed_count += 1
+        except MessageIdInvalid:
+            failed_count += 1
+        except Exception:
+            failed_count += 1
+
+        await asyncio.sleep(0.5)
+
+        # Progress update every 4 seconds
+        now = asyncio.get_event_loop().time()
+        if now - last_edit_time >= 4:
+            last_edit_time = now
+            pct = int(idx / total_to_delete * 100)
+            try:
+                await status_msg.edit_text(
+                    f"🗑 **Deleting… {pct}%**\n\n"
+                    f"Deleted: `{deleted_count}/{total_to_delete}`\n"
+                    f"Failed: `{failed_count}`"
+                )
+            except Exception:
+                pass
+
+    await status_msg.edit_text(
+        "✅ **Deletion Complete!**\n\n"
+        f"📊 **Summary**\n"
+        f"• Total IDs scanned: `{scanned}`\n"
+        f"• Matched & attempted: `{total_to_delete}`\n"
+        f"• Successfully deleted: `{deleted_count}`\n"
+        f"• Failed/skipped: `{failed_count}`\n"
+        f"• Types deleted: `{', '.join(sorted(selected))}`"
+    )
 
 # ─── Health check for Koyeb ─────────────────────────────────────────────────
 
