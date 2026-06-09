@@ -1,6 +1,7 @@
 import asyncio
 import re
 import os
+import threading
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -19,7 +20,6 @@ user_states = {}
 
 def parse_message_link(link: str):
     """Returns (chat_id_or_username, message_id) or None."""
-    # https://t.me/username/123  or  https://t.me/c/1234567890/123
     m = re.match(r"https?://t\.me/c/(-?\d+)/(\d+)", link.strip())
     if m:
         return int("-100" + m.group(1)), int(m.group(2))
@@ -53,6 +53,22 @@ def get_msg_type(msg: Message) -> str:
     if msg.sticker:   return "sticker"
     if msg.text:      return "text"
     return "other"
+
+# ─── /start & /help ──────────────────────────────────────────────────────────
+
+@bot.on_message(filters.command(["start", "help"]) & filters.private)
+async def cmd_start(client: Client, message: Message):
+    await message.reply(
+        "👋 **Bulk Message Delete Bot**\n\n"
+        "Use `/delete` to start a bulk deletion session.\n\n"
+        "**Steps:**\n"
+        "1. Send the first message link\n"
+        "2. Send the last message link\n"
+        "3. Choose message types (Document, Image, Video, Audio, Sticker, Text, or All)\n"
+        "4. Press **Delete Now**\n\n"
+        "⚠️ The bot must be an **admin with Delete Messages** permission in the channel.",
+        quote=True,
+    )
 
 # ─── /delete command ────────────────────────────────────────────────────────
 
@@ -157,16 +173,13 @@ async def handle_callback(client: Client, query: CallbackQuery):
         last_id = state["last_id"]
         del user_states[uid]
 
-        # ── Scan & delete ────────────────────────────────────────────────
         to_delete = []
         deleted_count = 0
         failed_count = 0
         scanned = 0
         total_range = last_id - first_id + 1
-
         status_msg = query.message
-
-        BATCH = 200  # Telegram allows up to 200 ids per deleteMessages call
+        BATCH = 200
 
         async def flush_delete():
             nonlocal deleted_count, failed_count
@@ -175,7 +188,7 @@ async def handle_callback(client: Client, query: CallbackQuery):
             try:
                 await client.delete_messages(chat, to_delete)
                 deleted_count += len(to_delete)
-            except (MessageDeleteForbidden, ChatAdminRequired) as e:
+            except (MessageDeleteForbidden, ChatAdminRequired):
                 failed_count += len(to_delete)
             except FloodWait as fw:
                 await asyncio.sleep(fw.value + 1)
@@ -188,7 +201,6 @@ async def handle_callback(client: Client, query: CallbackQuery):
                 failed_count += len(to_delete)
             to_delete.clear()
 
-        # Iterate in chunks of 200 IDs
         chunk_size = 200
         last_edit_time = 0
 
@@ -222,7 +234,6 @@ async def handle_callback(client: Client, query: CallbackQuery):
                 if len(to_delete) >= BATCH:
                     await flush_delete()
 
-            # Progress update every 5 seconds
             now = asyncio.get_event_loop().time()
             if now - last_edit_time >= 5:
                 last_edit_time = now
@@ -237,7 +248,6 @@ async def handle_callback(client: Client, query: CallbackQuery):
                 except Exception:
                     pass
 
-        # Flush remaining
         await flush_delete()
 
         await status_msg.edit_text(
@@ -249,44 +259,30 @@ async def handle_callback(client: Client, query: CallbackQuery):
             f"• Types deleted: `{', '.join(sorted(selected))}`"
         )
 
-# ─── /start & /help ──────────────────────────────────────────────────────────
-
-@bot.on_message(filters.command(["start", "help"]) & filters.private)
-async def cmd_start(client: Client, message: Message):
-    await message.reply(
-        "👋 **Bulk Message Delete Bot**\n\n"
-        "Use `/delete` to start a bulk deletion session.\n\n"
-        "**Steps:**\n"
-        "1. Send the first message link\n"
-        "2. Send the last message link\n"
-        "3. Choose message types (Document, Image, Video, Audio, Sticker, Text, or All)\n"
-        "4. Press **Delete Now**\n\n"
-        "⚠️ The bot must be an **admin with Delete Messages** permission in the channel.",
-        quote=True,
-    )
-
 # ─── Health check for Koyeb ─────────────────────────────────────────────────
 
 async def health(request):
     return web.Response(text="OK")
 
-async def run_web():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    print("Health server running on port 8080")
+def run_web():
+    async def _start():
+        app = web.Application()
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", 8080)
+        await site.start()
+        print("Health server running on port 8080")
+        await asyncio.Event().wait()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_start())
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
-async def main():
-    await run_web()
-    await bot.start()
-    print("Bot started!")
-    await asyncio.Event().wait()
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    t = threading.Thread(target=run_web, daemon=True)
+    t.start()
+    bot.run()
